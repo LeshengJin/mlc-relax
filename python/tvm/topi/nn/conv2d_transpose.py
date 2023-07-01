@@ -134,6 +134,68 @@ def declaration_conv2d_transpose_impl(data, kernel, strides, padding, out_dtype,
     return Output
 
 
+# def conv1d_transpose_nchw(Input, Filter, strides, padding, out_dtype, output_padding):
+#     return declaration_conv1d_transpose_impl(
+#         Input, Filter, strides, padding, out_dtype, output_padding=output_padding
+#     )
+
+
+# def conv1d_transpose_nchw_preprocess(data, kernel, strides, padding, out_dtype, output_padding):
+#     """Preprocess data and kernel to make the compute pattern
+#     of conv1d_transpose the same as conv1d"""
+#     batch, in_c, in_w = data.shape
+#     _, out_c, filter_w = kernel.shape
+#     stride_w = strides
+#     opad_w = output_padding
+#     assert opad_w < stride_w
+#     # dilate data
+#     data_dilate = dilate(data, [1, 1, stride_w], name="data_dilate")
+#     # pad data
+#     fpad_top, fpad_left, fpad_bottom, fpad_right = get_pad_tuple(padding, (0, filter_w))
+#     bpad_left = filter_w - 1 - fpad_left
+#     bpad_right = filter_w - 1 - fpad_right + opad_w
+#     data_pad = pad(
+#         data_dilate, [0, 0, bpad_left], [0, 0, bpad_right], name="data_pad"
+#     )
+#     # transform kernel layout from IOHW to OIHW, and rotate kernel by 180 degrees
+#     kernel_transform = te.compute(
+#         (out_c, in_c, filter_w),
+#         lambda o, i, w: kernel[i][o][filter_w - 1 - w],
+#         name="kernel_transform",
+#     )
+#     return data_pad, kernel_transform
+
+
+# def declaration_conv1d_transpose_impl(data, kernel, strides, padding, out_dtype, output_padding):
+#     """Implementation of conv1d transpose"""
+#     data_pad, kernel_transform = conv2d_transpose_nchw_preprocess(
+#         data, kernel, strides, padding, out_dtype, output_padding
+#     )
+#     batch, in_c, in_h, in_w = data_pad.shape
+#     out_c, _, filter_h, filter_w = kernel_transform.shape
+
+#     # convolution stage
+#     out_c = simplify(out_c)
+
+#     out_h = simplify(in_h - filter_h + 1)
+#     out_w = simplify(in_w - filter_w + 1)
+#     dc = te.reduce_axis((0, in_c), name="dc")
+#     dh = te.reduce_axis((0, filter_h), name="dh")
+#     dw = te.reduce_axis((0, filter_w), name="dw")
+
+#     Output = te.compute(
+#         (batch, out_c, out_h, out_w),
+#         lambda b, c, h, w: te.sum(
+#             data_pad[b, dc, h + dh, w + dw].astype(out_dtype)
+#             * kernel_transform[c, dc, dh, dw].astype(out_dtype),
+#             axis=[dc, dh, dw],
+#         ),
+#         tag="conv2d_transpose_nchw",
+#     )
+
+#     return Output
+
+
 def group_conv2d_transpose_nchw(data, kernel, stride, padding, out_dtype, output_padding, groups):
     """Group convolution operator in NCHW layout.
 
