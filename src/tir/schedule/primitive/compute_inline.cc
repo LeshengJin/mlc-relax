@@ -482,14 +482,14 @@ class ComputeInliner : public BaseInliner {
     for (const auto& iter : producer_block->iter_vars) {
       producer_iter_doms.Set(iter->var, iter->dom);
     }
-    auto res = arith::DetectIterMap(
+    arith::IterMapResult res = arith::DetectIterMap(
         /*indices=*/inlined_store_->indices,
         /*input_iters=*/producer_iter_doms,
         /*predicate=*/true,
         /*check_level=*/arith::IterMapLevel::Bijective,
         /*analyzer=*/&analyzer_,
         /*simplify_trivial_iterators=*/false);
-    if (res->indices.empty()) {
+    if (!res->errors.empty()) {
       // Failure: indices of BufferStore are not bijective affine
       return false;
     }
@@ -581,8 +581,7 @@ class ReverseComputeInliner : public BaseInliner {
                                  const StmtSRef& scope_root_sref, const IRModule& mod)
       : BaseInliner(inlined_buffer, consumer_block_realize->block, scope_root_sref),
         producer_block_(producer_block),
-        consumer_block_(consumer_block_realize->block.get()),
-        mod_(mod) {
+        consumer_block_(consumer_block_realize->block.get()) {
     // Initialize the predicates to ensure consumer block iters are in-bound
     consumer_iter_in_bound_ = Bool(true);
     for (const IterVar& iter : consumer_block_realize->block->iter_vars) {
@@ -625,7 +624,7 @@ class ReverseComputeInliner : public BaseInliner {
       }
     }
 
-    auto res = arith::DetectIterMap(
+    arith::IterMapResult res = arith::DetectIterMap(
         /*indices=*/buffer_load_indices_,
         /*input_iters=*/consumer_iter_doms,
         /*predicate=*/true,
@@ -638,7 +637,15 @@ class ReverseComputeInliner : public BaseInliner {
       return false;
     }
 
-    const BufferStoreNode* producer_store = producer_block_->body.as<BufferStoreNode>();
+    const BufferStoreNode* producer_store = nullptr;
+    if (const auto* producer_if = producer_block_->body.as<tir::IfThenElseNode>()) {
+      if (producer_if->else_case.defined()) {
+        return false;
+      }
+      producer_store = producer_if->then_case.as<BufferStoreNode>();
+    } else {
+      producer_store = producer_block_->body.as<BufferStoreNode>();
+    }
     if (producer_store == nullptr) {
       // Failure: producer block body is not BufferStore
       return false;
@@ -657,7 +664,7 @@ class ReverseComputeInliner : public BaseInliner {
   using BaseInliner::VisitStmt_;
 
   /*! \brief Generate the predicate after inlining based on the consumer predicate */
-  PrimExpr BuildInlinedConsumerPredicate(const BlockNode* producer_block) {
+  Block BuildInlinedConsumerPredicate(const BlockNode* producer_block) {
     // Bind the producer block iter domains for simplification
     Map<Var, PrimExpr> subst_map;
     for (int i = 0, n = producer_block->iter_vars.size(); i < n; ++i) {
@@ -668,19 +675,27 @@ class ReverseComputeInliner : public BaseInliner {
     PrimExpr predicate = Substituter(this)(consumer_iter_in_bound_);
     // Simplify the predicate using the producer block iter domains
     predicate = analyzer_.Simplify(predicate);
-    return predicate;
+    ObjectPtr<BlockNode> block = make_object<BlockNode>(*producer_block);
+    if (is_one(predicate)) {
+      return Block(block);
+    }
+    if (const auto* if_ = producer_block->body.as<tir::IfThenElseNode>()) {
+      PrimExpr if_predicate = analyzer_.Simplify(if_->condition);
+      if (!StructuralEqual()(predicate, if_predicate)) {
+        predicate = analyzer_.Simplify(predicate && if_->condition);
+      }
+      block->body = IfThenElse(predicate, if_->then_case);
+      return Block(block);
+    }
+    block->body = IfThenElse(predicate, block->body);
+    return Block(block);
   }
 
   Stmt VisitStmt_(const BlockNode* op) final {
     Block src_block = GetRef<Block>(op);
     Block tgt_block = Downcast<Block>(BaseInliner::VisitStmt_(op));
     if (op == producer_block_) {
-      auto new_predicate = BuildInlinedConsumerPredicate(tgt_block.get());
-      if (!is_one(new_predicate)) {
-        tgt_block.CopyOnWrite()->body = IfThenElse(new_predicate, tgt_block->body);
-      } else {
-        tgt_block.CopyOnWrite()->body = tgt_block->body;
-      }
+      tgt_block = BuildInlinedConsumerPredicate(tgt_block.get());
       block_reuse.Set(src_block, tgt_block);
     }
     return std::move(tgt_block);
@@ -797,8 +812,6 @@ class ReverseComputeInliner : public BaseInliner {
   PrimExpr consumer_iter_in_bound_{nullptr};
   /*! \brief The arithmetic analyzer */
   arith::Analyzer analyzer_;
-  /*! \brief The target module, only used for error reporting. */
-  const IRModule& mod_;
 };
 
 void ComputeInlineImpl(ScheduleState self, const StmtSRef& producer_block_sref,
