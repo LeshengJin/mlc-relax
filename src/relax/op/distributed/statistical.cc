@@ -35,7 +35,7 @@ StructInfo InferDistStructInfoStatistical(const Call& call, const BlockBuilder& 
     axes = NormalizeAxes(call, ctx, data_sinfo->ndim, attrs->axis.value());
   }
 
-  int out_ndim;
+  int out_ndim = 0;
   if (attrs->keepdims) {
     out_ndim = data_sinfo->ndim;
   } else if (!attrs->axis.defined()) {

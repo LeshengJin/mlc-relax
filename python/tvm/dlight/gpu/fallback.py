@@ -16,23 +16,12 @@
 # under the License.
 # pylint: disable=missing-docstring
 """A fallback schedule rule for GPU operators."""
-from typing import Callable, List
+from typing import List
 
 from tvm import tir
-from tvm._ffi import get_global_func
 from tvm.target import Target
 
-from ..base import ScheduleRule
-
-
-def _max_threads_per_block(target: Target) -> int:
-    max_threads_per_block = None
-    for name in ["max_threads_per_block", "max_num_threads"]:
-        if max_threads_per_block is None:
-            max_threads_per_block = target.attrs.get(name, None)
-    if max_threads_per_block is None:
-        max_threads_per_block = 64
-    return int(max_threads_per_block)
+from ..base import ScheduleRule, analysis, normalize_prim_func, try_inline
 
 
 class Fallback(ScheduleRule):
@@ -47,40 +36,21 @@ class Fallback(ScheduleRule):
         target: Target,
         _: bool,
     ) -> tir.Schedule:
-        max_threads_per_block = _max_threads_per_block(target)
-        get_loop_iter_type = get_global_func("tir.schedule.GetLoopIterType")
+        max_threads_per_block = analysis.get_max_threads_per_block(target)
 
         sch = tir.Schedule(func)
-        blocks = sch.get_child_blocks(sch.get_block(sch.mod["main"].body.block.name_hint))
-
-        while True:
-
-            def _try_inline(func: Callable):
-                for i, block in enumerate(blocks):
-                    try:
-                        func(block)
-                    except:  # pylint: disable=bare-except
-                        continue
-                    return i
-                return None
-
-            i = _try_inline(sch.compute_inline)
-            if i is None:
-                i = _try_inline(sch.reverse_compute_inline)
-            if i is None:
-                break
-            blocks.pop(i)
-
-        for block in blocks:
+        block_infos = try_inline(sch, normalize_prim_func(sch))
+        for block in block_infos:
             s_loops: List[tir.schedule.LoopRV] = []
             r_loops: List[tir.schedule.LoopRV] = []
             o_loops: List[tir.schedule.LoopRV] = []
-            for loop in sch.get_loops(block):
-                iter_type = get_loop_iter_type(sch, loop)
+            dom_kind = block.dom_kind()
+            block = block.block_rv
+            for loop, iter_type in zip(sch.get_loops(block), dom_kind):
                 {"S": s_loops, "R": r_loops, "O": o_loops}[iter_type].append(loop)
 
             if not s_loops:
-                s_loops.append(sch.add_unit_loop(block))
+                s_loops.append(sch.add_unit_loop(block.block))
             sch.reorder(*s_loops, *r_loops, *o_loops)
             bx, tx = sch.split(  # pylint: disable=invalid-name
                 sch.fuse(*s_loops),

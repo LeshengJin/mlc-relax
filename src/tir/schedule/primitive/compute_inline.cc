@@ -177,14 +177,18 @@ class NonSingleProducerError : public ScheduleError {
         self, GetRef<Block>(consumer_block), scope_root_sref);
     class ProducerFinder : public StmtVisitor {
      public:
-      static std::vector<Block> GetProducer(const Buffer& buffer, const Block& scope_block) {
-        ProducerFinder finder(buffer);
+      static std::vector<Block> GetProducer(const ScheduleState& self,
+                                            const StmtSRef& scope_root_sref, const Buffer& buffer,
+                                            const Block& scope_block) {
+        ProducerFinder finder(self, scope_root_sref, buffer);
         finder(scope_block);
         return finder.producer_across_scope_.back();
       }
 
      private:
-      explicit ProducerFinder(const Buffer& buffer) : buffer_(buffer) {
+      explicit ProducerFinder(const ScheduleState& self, const StmtSRef& scope_root_sref,
+                              const Buffer& buffer)
+          : self_(self), scope_root_sref_(scope_root_sref), buffer_(buffer) {
         producer_across_scope_.push_back({});
       }
 
@@ -204,16 +208,23 @@ class NonSingleProducerError : public ScheduleError {
         producer_across_scope_.pop_back();
         for (const auto& write : node->writes) {
           if (write->buffer.same_as(buffer_)) {
+            // Check if the producer block is a complete block
+            StmtSRef producer_block_sref = self_->stmt2ref.at(node);
+            if (!IsCompleteBlock(self_, producer_block_sref, scope_root_sref_)) {
+              throw NonSingleProducerError(self_->mod, GetRef<Block>(node));
+            }
             producer_across_scope_.back().push_back(GetRef<Block>(node));
             break;
           }
         }
       }
+      ScheduleState self_;
+      StmtSRef scope_root_sref_;
       Buffer buffer_;
       std::vector<std::vector<Block>> producer_across_scope_;
     };
-    std::vector<Block> producer_across_scope =
-        ProducerFinder::GetProducer(consumer_buffer, GetRef<Block>(scope_block));
+    std::vector<Block> producer_across_scope = ProducerFinder::GetProducer(
+        self, scope_root_sref, consumer_buffer, GetRef<Block>(scope_block));
     if (producer_across_scope.size() != 1) {
       throw NonSingleProducerError(self->mod, GetRef<Block>(consumer_block));
     }
@@ -645,6 +656,13 @@ class ReverseComputeInliner : public BaseInliner {
       producer_store = producer_if->then_case.as<BufferStoreNode>();
     } else {
       producer_store = producer_block_->body.as<BufferStoreNode>();
+      if (producer_block_->annotations.count(tir::attr::auto_copy) != 0) {
+        const ForNode* producer_inner_loop = producer_block_->body.as<ForNode>();
+        while (producer_inner_loop->body.as<ForNode>()) {
+          producer_inner_loop = producer_inner_loop->body.as<ForNode>();
+        }
+        producer_store = producer_inner_loop->body.as<BufferStoreNode>();
+      }
     }
     if (producer_store == nullptr) {
       // Failure: producer block body is not BufferStore
@@ -670,6 +688,18 @@ class ReverseComputeInliner : public BaseInliner {
     for (int i = 0, n = producer_block->iter_vars.size(); i < n; ++i) {
       const IterVar& iter = producer_block->iter_vars[i];
       analyzer_.Bind(iter->var, Range::FromMinExtent(iter->dom->min, iter->dom->extent));
+    }
+    if (producer_block->annotations.count(tir::attr::auto_copy) != 0) {
+      auto bind = [&](const ForNode* loop) {
+        analyzer_.Bind(loop->loop_var,
+                       Range::FromMinExtent(make_zero(loop->extent->dtype), loop->extent));
+      };
+      const ForNode* producer_inner_loop = producer_block->body.as<ForNode>();
+      while (producer_inner_loop->body.as<ForNode>()) {
+        bind(producer_inner_loop);
+        producer_inner_loop = producer_inner_loop->body.as<ForNode>();
+      }
+      bind(producer_inner_loop);
     }
     // Substitute the consumer block iters with the corresponding iters in the producer blocks
     PrimExpr predicate = Substituter(this)(consumer_iter_in_bound_);

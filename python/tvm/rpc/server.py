@@ -25,6 +25,7 @@ Server is TCP based with the following protocol:
    - {server|client}:device-type[:random-key] [-timeout=timeout]
 """
 # pylint: disable=invalid-name
+import os
 import ctypes
 import socket
 import select
@@ -34,6 +35,7 @@ import threading
 import multiprocessing
 import time
 import errno
+import sys
 import tvm._ffi
 
 from tvm._ffi.base import py_str
@@ -118,16 +120,6 @@ def _server_env(load_library, work_path=None):
     return temp
 
 
-def _serve_loop(sock, addr, load_library, work_path=None):
-    """Server loop"""
-    sockfd = sock.fileno()
-    temp = _server_env(load_library, work_path)
-    _ffi_api.ServerLoop(sockfd)
-    if not work_path:
-        temp.remove()
-    logger.info("Finish serving %s", addr)
-
-
 def _parse_server_opt(opts):
     # parse client options
     ret = {}
@@ -135,6 +127,47 @@ def _parse_server_opt(opts):
         if kv.startswith("-timeout="):
             ret["timeout"] = float(kv[9:])
     return ret
+
+
+def _serving(sock, addr, opts, load_library):
+    logger.info(f"connected from {addr}")
+    work_path = utils.tempdir()
+    old_cwd = os.getcwd()
+    os.chdir(work_path.path)  # Avoiding file name conflict between sessions.
+    logger.info(f"start serving at {work_path.path}")
+
+    def _serve_loop():
+        _server_env(load_library, work_path)
+        _ffi_api.ServerLoop(sock.fileno())
+
+    server_proc = multiprocessing.Process(target=_serve_loop)
+    server_proc.start()
+    server_proc.join(opts.get("timeout", None))  # Wait until finish or timeout.
+
+    if server_proc.is_alive():
+        logger.info("timeout in RPC session, kill..")
+        _ffi_api.ReturnException(
+            sock.fileno(),
+            f'RPCSessionTimeoutError: Your {opts["timeout"]}s session has expired, '
+            f'try to increase the "session_timeout" value.',
+        )
+
+        try:
+            import psutil  # pylint: disable=import-outside-toplevel
+
+            # Terminate worker children firstly.
+            for child in psutil.Process(server_proc.pid).children(recursive=True):
+                child.terminate()
+        except ImportError:
+            # Don't dependent `psutil` hardly, because it isn't a pure Python
+            # package and maybe hard to be installed on some platforms.
+            pass
+        server_proc.terminate()
+
+    logger.info(f"finish serving {addr}")
+    os.chdir(old_cwd)
+    work_path.remove()
+    sock.close()
 
 
 def _listen_loop(sock, port, rpc_key, tracker_addr, load_library, custom_addr):
@@ -237,30 +270,7 @@ def _listen_loop(sock, port, rpc_key, tracker_addr, load_library, custom_addr):
             raise exc
 
         # step 3: serving
-        work_path = utils.tempdir()
-        logger.info("connection from %s", addr)
-        server_proc = multiprocessing.Process(
-            target=_serve_loop, args=(conn, addr, load_library, work_path)
-        )
-
-        server_proc.start()
-        # close from our side.
-        conn.close()
-        # wait until server process finish or timeout
-        server_proc.join(opts.get("timeout", None))
-
-        if server_proc.is_alive():
-            logger.info("Timeout in RPC session, kill..")
-            # pylint: disable=import-outside-toplevel
-            import psutil
-
-            parent = psutil.Process(server_proc.pid)
-            # terminate worker children
-            for child in parent.children(recursive=True):
-                child.terminate()
-            # terminate the worker
-            server_proc.terminate()
-        work_path.remove()
+        _serving(conn, addr, opts, load_library)
 
 
 def _connect_proxy_loop(addr, key, load_library):
@@ -285,15 +295,8 @@ def _connect_proxy_loop(addr, key, load_library):
                 raise RuntimeError(f"{str(addr)} is not RPC Proxy")
             keylen = struct.unpack("<i", base.recvall(sock, 4))[0]
             remote_key = py_str(base.recvall(sock, keylen))
-            opts = _parse_server_opt(remote_key.split()[1:])
-            logger.info("connected to %s", str(addr))
-            process = multiprocessing.Process(target=_serve_loop, args=(sock, addr, load_library))
-            process.start()
-            sock.close()
-            process.join(opts.get("timeout", None))
-            if process.is_alive():
-                logger.info("Timeout in RPC session, kill..")
-                process.terminate()
+
+            _serving(sock, addr, _parse_server_opt(remote_key.split()[1:]), load_library)
             retry_count = 0
         except (socket.error, IOError) as err:
             retry_count += 1
@@ -334,7 +337,12 @@ class PopenRPCServerState(object):
 
         if not is_proxy:
             sock = socket.socket(base.get_addr_family((host, port)), socket.SOCK_STREAM)
-            if reuse_addr:
+
+            # Never set socket SO_REUSEADDR on Windows. The SO_REUSEADDR flag allow reusing the
+            # inactivate TIME_WATI state sockets on POSIX, but on Windows it will allow two or more
+            # activate sockets to bind on the same address and port if they all set SO_REUSEADDR,
+            # and result in indeterminate behavior.
+            if reuse_addr and sys.platform != "win32":
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             if timeout is not None:
                 sock.settimeout(timeout)

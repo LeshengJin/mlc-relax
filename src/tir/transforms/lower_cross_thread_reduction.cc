@@ -505,13 +505,10 @@ class CrossThreadReductionTransformer : public StmtMutator {
       const BlockRealizeNode* realize) {
     std::unordered_map<ThreadScope, Range, ThreadScopeHash, ThreadScopeEqual> unbound_thread2range =
         thread2range_;
-    for (const PrimExpr& iter_value : realize->iter_values) {
-      for (const Var& var : UndefinedVars(iter_value)) {
-        auto it = thread_loop_var2scope_.find(var.get());
-        if (it == thread_loop_var2scope_.end()) {
-          continue;
-        }
-        unbound_thread2range.erase(it->second);
+    for (const ForNode* loop : loop_stack_) {
+      if (loop->thread_binding.defined()) {
+        ThreadScope scope = ThreadScope::Create(loop->thread_binding.value()->thread_tag);
+        unbound_thread2range.erase(scope);
       }
     }
 
@@ -628,25 +625,33 @@ class CrossThreadReductionTransformer : public StmtMutator {
     // the "loop var -> thread scope" relation, in order to collect all existing
     // threads within a thread block.
     // - we are careful about thread block boundary for safety.
-    int old_thread_block_depth = thread_block_depth_;
+    bool is_block_idx = false;
+    bool is_thread_idx = false;
     if (loop->kind == ForKind::kThreadBinding) {
       ThreadScope scope = ThreadScope::Create(loop->thread_binding.value()->thread_tag);
-      if (scope.rank == 0 || !thread_block_depth_) {
-        if (!thread_block_depth_) {
-          thread2range_.clear();
-        }
-        ++thread_block_depth_;
-      }
       if (scope.rank == 1 && scope.dim_index >= 0) {
+        is_thread_idx = true;
+        ++thread_idx_depth;
         thread2range_[scope] = Range::FromMinExtent(loop->min, loop->extent);
         thread_loop_var2scope_[loop->loop_var.get()] = scope;
+      } else if (scope.rank == 0) {
+        is_block_idx = true;
+        ++block_idx_depth;
       }
     }
 
     Stmt result = StmtMutator::VisitStmt_(loop);
     loop_stack_.pop_back();
     loop_range_map_.erase(loop->loop_var);
-    thread_block_depth_ = old_thread_block_depth;
+    if (is_thread_idx) {
+      --thread_idx_depth;
+    }
+    if (is_block_idx) {
+      --block_idx_depth;
+    }
+    if (is_block_idx || (is_thread_idx && thread_idx_depth == 0 && block_idx_depth == 0)) {
+      thread2range_.clear();
+    }
 
     // Replace `result` with the pre-stored result if `loop` appears as a key in `loop2new_stmt_`.
     auto it = loop2new_stmt_.find(loop);
@@ -756,11 +761,17 @@ class CrossThreadReductionTransformer : public StmtMutator {
     if (!reduction_loops.empty()) {
       // Return an empty statement, because the transformation result will
       // be inserted when returning to the first reduction-related loop.
+      has_cross_thread_reduction_ = true;
       MakeCrossThreadReduction(realize, reduction_loops);
       return Stmt{nullptr};
     }
 
+    if (!has_cross_thread_reduction_) {
+      return StmtMutator::VisitStmt_(realize);
+    }
+
     // Part 2. Check if the block needs all-thread broadcasting rewrite.
+    // We only check this when cross-thread reduction was detected.
     std::vector<std::pair<ThreadScope, Range>> unbound_thread2range =
         NeedCrossThreadBroadcast(realize);
     if (!unbound_thread2range.empty()) {
@@ -771,6 +782,7 @@ class CrossThreadReductionTransformer : public StmtMutator {
   }
 
  private:
+  bool has_cross_thread_reduction_ = false;
   std::vector<const StmtNode*> statement_stack_;
   std::vector<const ForNode*> loop_stack_;
   std::vector<const BlockNode*> block_stack_;
@@ -779,7 +791,8 @@ class CrossThreadReductionTransformer : public StmtMutator {
   Map<Var, Range> loop_range_map_;
   arith::Analyzer analyzer_;
 
-  int thread_block_depth_ = 0;
+  int block_idx_depth = 0;
+  int thread_idx_depth = 0;
   std::unordered_map<ThreadScope, Range, ThreadScopeHash, ThreadScopeEqual> thread2range_;
   std::unordered_map<const VarNode*, ThreadScope> thread_loop_var2scope_;
 };

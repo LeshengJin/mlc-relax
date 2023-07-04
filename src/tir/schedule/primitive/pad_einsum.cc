@@ -76,7 +76,7 @@ class InvalidPaddingError : public ScheduleError {
   String DetailRenderTemplate() const final {
     std::ostringstream os;
     os << "The padding for the block {0} are invalid. It should be a list of "
-       << block_->iter_vars.size() << " non-negative integers. Got " << padding_;
+       << block_->iter_vars.size() << " positive integers. Got " << padding_;
     return os.str();
   }
 
@@ -327,7 +327,9 @@ class PadEinsumBufferReplacer : public StmtExprMutator {
         writes.push_back(write);
       }
     }
-    Block new_block = Block(iter_vars, reads, writes, block->name_hint, block->body, block->init);
+    Block new_block =
+        Block(iter_vars, reads, writes, block->name_hint, block->body, block->init,
+              /*alloc_buffers=*/{}, /*match_buffers=*/{}, /*annotations=*/block->annotations);
     block_sref_reuse_.Set(old_block, new_block);
     return new_block;
   }
@@ -367,7 +369,7 @@ class PadEinsumBufferReplacer : public StmtExprMutator {
   Map<Block, Block> block_sref_reuse_;
 };
 
-void PadEinsum(ScheduleState self, StmtSRef block_sref, Array<Integer> padding) {
+void PadEinsum(ScheduleState self, const StmtSRef& block_sref, const Array<Integer>& padding) {
   arith::Analyzer analyzer;
   // Step 1: Input checking and error handling
   const BlockNode* block = TVM_SREF_TO_BLOCK(block_sref);
