@@ -43,11 +43,145 @@ namespace relax {
 
 // We will use NestedMsg<Expr> to handle adjoint updates involving tuple handling
 using AdjointMsg = NestedMsg<Expr>;
+using VarIdSet = std::unordered_set<Id, ObjectPtrHash, ObjectPtrEqual>;
+
+// Used in CallTIRWithGradCollector. call_tir -> call_tir_with_grad
+using CallTIRWithGradInfo = std::unordered_map<Call, Call, ObjectPtrHash, ObjectPtrEqual>;
+
+/*!
+ * \brief Collect all call_tir_with_grad nodes, transform them into call_tir nodes, and collect the
+ * te_grad_name and te_grad_kwargs information.
+ */
+class CallTIRWithGradEliminator : private ExprMutator {
+ public:
+  /*!
+   * \brief Collect all variables that needs to be checkpointed, and remove the start_checkpoint
+   * and the end_checkpoint bindings.
+   *
+   * \param func The original function
+   * \return The function with all start_checkpoint and end_checkpoint bindings removed, and a
+   * VarIdSet containing all checkpointed vars.
+   */
+  static Function Transform(const Function& func) {
+    return Downcast<Function>(CallTIRWithGradEliminator().VisitExpr(func));
+  }
+
+ private:
+  using ExprMutator::VisitExpr_;
+
+  Expr VisitExpr_(const CallNode* call_node) final {
+    if (call_node->op != Op::Get("relax.call_tir_with_grad")) {
+      return ExprMutator::VisitExpr_(call_node);
+    }
+    return Call(Op::Get("relax.call_tir"), call_node->args, {}, call_node->sinfo_args,
+                call_node->span);
+  }
+};
+
+/*!
+ * \brief Collect all variables that needs to be checkpointed, and remove the start_checkpoint
+ * and the end_checkpoint bindings.
+ *
+ * Here we have some principles to determine which var should be checkpointed:
+ * 1. Input of the function is checkpointed
+ * 2. For var x marked with start_checkpoint() (wrapped by start_checkpoint), it means x is an input
+ *    to some checkpoint function. So var x is checkpointed
+ * 3. For other var x , find its predecessor path.
+ *   a. If every predecessor path is marked with end_checkpoint(), x is checkpointed
+ *   b. Else, there must exists a predecessor path marked with start_checkpoint(). So x is not
+ *      checkpointed
+ */
+class CheckpointCollector : private ExprMutator {
+ public:
+  /*!
+   * \brief Collect all variables that needs to be checkpointed, and remove the start_checkpoint
+   * and the end_checkpoint bindings.
+   *
+   * \param func The original function
+   * \return The function with all start_checkpoint and end_checkpoint bindings removed, and a
+   * VarIdSet containing all checkpointed vars.
+   */
+  static std::pair<Function, VarIdSet> Collect(const Function& func) {
+    auto collector = CheckpointCollector();
+    return std::make_pair(Downcast<Function>(collector.VisitExpr(func)), collector.checkpoints_);
+  }
+
+ private:
+  Expr VisitExpr_(const FunctionNode* func) final {
+    for (auto var : func->params) {
+      checkpoints_.insert(var->vid);
+    }
+
+    return ExprMutator::VisitExpr_(func);
+  }
+
+  void VisitBinding(const Binding& binding) {
+    static const auto s_cp = Op::Get("relax.grad.start_checkpoint");
+    static const auto e_cp = Op::Get("relax.grad.end_checkpoint");
+
+    // If every variable that the variable of binding relys on is either
+    // 1) the output of end_checkpoint; 2) checkpointed
+    // then the variable of binding will be checkpointed
+    auto var_binding = binding.as<VarBindingNode>();
+    ICHECK(var_binding);
+
+    auto value_call = var_binding->value.as<CallNode>();
+    if (!value_call || (value_call->op != s_cp && value_call->op != e_cp)) {
+      bool all_inner_var_checkpointed = true;
+      PostOrderVisit(var_binding->value, [this, &all_inner_var_checkpointed](const Expr& expr) {
+        if (auto var = expr.as<VarNode>()) {
+          all_inner_var_checkpointed &=
+              (checkpoints_.count(var->vid) != 0 || e_vars_.count(var->vid) != 0);
+        }
+      });
+
+      if (all_inner_var_checkpointed) {
+        checkpoints_.insert(var_binding->var->vid);
+      }
+    }
+
+    ExprMutator::VisitBinding(binding);
+  }
+
+  // mark vars to be checkpointed, and eliminate bindings with checkpoint calls
+  void VisitBinding_(const VarBindingNode* binding, const CallNode* value) final {
+    static const auto s_cp = Op::Get("relax.grad.start_checkpoint");
+    static const auto e_cp = Op::Get("relax.grad.end_checkpoint");
+
+    if (value->op == s_cp || value->op == e_cp) {
+      // Eliminate the binding
+      auto var = value->args[0].as<VarNode>();
+      ICHECK(var) << "The first argument of relax.grad.start_checkpoint and "
+                     "relax.grad.end_checkpoint should be a Var";
+      // var might already be remapped. Find the original var
+      auto orig_var = Downcast<Var>(ExprMutator::VisitExpr(GetRef<Var>(var)));
+      // Add remapping from binding->var to new_var
+      if (!binding->var.as<DataflowVarNode>() && var->IsInstance<DataflowVarNode>()) {
+        // For output binding, emit a dummy binding
+        this->var_remap_[binding->var->vid] = builder_->EmitOutput(orig_var, orig_var->name_hint());
+      } else {
+        this->var_remap_[binding->var->vid] = orig_var;
+      }
+
+      if (value->op == s_cp) {
+        // mark the original var to be checkpointed
+        checkpoints_.insert(orig_var->vid);
+      } else if (value->op == e_cp) {
+        e_vars_.insert(binding->var->vid);
+      }
+    } else {
+      ExprMutator::VisitBinding_(binding, value);
+    }
+  }
+
+  VarIdSet checkpoints_;
+  VarIdSet e_vars_;
+};
 
 /*!
  * \brief A tool class for BackwardBindingGenerator
  * Generate the checkpoint bindings. To be specific, in the backward process, we need to use vars
- * computed in the forward process. Those vars contained in the given checkpoint array, and the
+ * computed in the forward process. Those vars contained in the given checkpoints array, and the
  * inputs of the function, will be used as is; other vars will be computed again (this will
  * generate bindings) using the checkpoint vars.
  */
@@ -59,16 +193,12 @@ class CheckpointGenerator : private ExprMutator {
    * \param builder The BlockBuilder of BackwardBindingGenerator, used to generate bindings
    * \param orig_params The parameters of the forward function
    * \param forward_block The forward DataflowBlock
-   * \param checkpoint The checkpointed vars. If it is NullOpt, all vars will be checkpointed.
+   * \param checkpoints The checkpointed vars. checkpoints being empty means all Vars are
+   * checkpointed
    */
   CheckpointGenerator(const BlockBuilder& builder, const Array<Var>& orig_params,
-                      const DataflowBlock& forward_block, const Optional<Array<Var>>& checkpoint)
+                      const DataflowBlock& forward_block, const VarIdSet& checkpoints)
       : builder_(builder) {
-    std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual> checkpoint_set;
-    if (checkpoint) {
-      checkpoint_set.insert(checkpoint.value().begin(), checkpoint.value().end());
-    }
-
     // func params will always be checkpointed
     for (auto var : orig_params) {
       checkpoint_map_.Set(var, var);
@@ -79,7 +209,7 @@ class CheckpointGenerator : private ExprMutator {
       CHECK(var_binding) << "Now only support VarBindingNode";
       auto var = var_binding->var;
       binding_map_.Set(var, var_binding->value);
-      if (!checkpoint || checkpoint_set.count(var)) {
+      if (checkpoints.count(var->vid)) {
         checkpoint_map_.Set(var, var);
       }
     }
@@ -98,6 +228,8 @@ class CheckpointGenerator : private ExprMutator {
   }
 
  private:
+  using ExprMutator::VisitExpr_;
+
   // Visit the use-site of a defined Var
   Expr VisitExpr_(const VarNode* op) final { return VisitVar(GetRef<Var>(op)); }
 
@@ -114,8 +246,9 @@ class CheckpointGenerator : private ExprMutator {
     return new_var;
   }
 
-  // Create a new binding for Call node. The purpose for that is to pass the structural equal check.
-  Expr VisitExpr_(const CallNode* call_node) {
+  // The only purpose of this function is create a new expr for Call node
+  // to pass the structual equal check
+  Expr VisitExpr_(const CallNode* call_node) final {
     Expr new_op = this->VisitExpr(call_node->op);
 
     tvm::Array<Expr> call_args;
@@ -123,8 +256,7 @@ class CheckpointGenerator : private ExprMutator {
       Expr new_arg = this->VisitExpr(arg);
       call_args.push_back(new_arg);
     }
-
-    return Call(new_op, call_args, call_node->attrs, call_node->sinfo_args, call_node->span);
+    return Call(new_op, call_args, call_node->attrs, call_node->sinfo_args);
   }
 
   BlockBuilder builder_;
@@ -150,15 +282,15 @@ class BackwardBindingGenerator : private ExprVisitor {
    * \param target_var The target Var to differentiate
    * \param orig_return_value The original return value of the function. The new return value is a
    * 2-tuple, containing the original return value, and a tuple of the adjoints of parameters
-   * \param checkpoint The checkpointed vars. checkpoint being NullOpt means all Vars are
+   * \param checkpoints The checkpointed vars. checkpoints being empty means all Vars are
    * checkpointed
    * \return The return expr of new adjoint function.
    */
   static Expr Generate(const BlockBuilder& builder, const DataflowBlock& forward_block,
                        const Array<Var>& require_grads, const Var& target_var,
                        const Array<Var>& orig_params, const Expr& orig_return_value,
-                       const Optional<Array<Var>>& checkpoint) {
-    CheckpointGenerator checkpoint_generator(builder, orig_params, forward_block, checkpoint);
+                       const VarIdSet& checkpoints) {
+    CheckpointGenerator checkpoint_generator(builder, orig_params, forward_block, checkpoints);
     BackwardBindingGenerator generator(builder, checkpoint_generator);
 
     // Initialize the adjoint of target_var as ones op. We have already checked the target.
@@ -213,30 +345,31 @@ class BackwardBindingGenerator : private ExprVisitor {
     Var adjoint_var = adjoint_var_map_[binding->var];
     const Op& call_op = Downcast<Op>(call->op);
 
-    // Support checkpointing
+    // Support for checkpointing
     auto [checkpoint_var, checkpoint_call] =
         checkpoint_generator_.UpdateBinding(binding->var, GetRef<Call>(call));
 
     if (call_op == Op::Get("relax.call_tir")) {
-      auto te_grad_name = call->attrs.as<CallTIRAttrs>()->te_grad_name;
-      if (te_grad_name) {
-        auto* grad_func = tvm::runtime::Registry::Get(te_grad_func_prefix + te_grad_name.value());
-        CHECK(grad_func) << "te grad function " << te_grad_name.value() << " not registered";
-        Var result_var = (*grad_func)(builder_, adjoint_var, checkpoint_call);
-        Tuple args = Downcast<Tuple>(call->args[1]);
-        auto* tuple_sinfo = GetStructInfoAs<TupleStructInfoNode>(result_var);
-        if (!tuple_sinfo) {
-          // result_var is a tensor
-          ICHECK(args->fields.size() == 1);
-          UpdateAdjoint(args->fields[0], result_var);
-        } else {
-          ICHECK(args->fields.size() == tuple_sinfo->fields.size());
-          for (int i = 0; i < static_cast<int>(args->fields.size()); ++i) {
-            UpdateAdjoint(args->fields[i], TupleGetItem(result_var, i));
-          }
-        }
+      LOG(FATAL) << "Differentiation of call_tir op without registering corresponding gradient "
+                    "function is not supported yet.";
+    } else if (call_op == Op::Get("relax.call_tir_with_grad")) {
+      // tir gradient registering
+      auto te_grad_name = call->attrs.as<CallTIRWithGradAttrs>()->te_grad_name;
+      auto* grad_func = tvm::runtime::Registry::Get(te_grad_func_prefix + te_grad_name);
+      CHECK(grad_func) << "TIR gradient function " << te_grad_name << " is not registered";
+      Var partials =
+          (*grad_func)(checkpoint_var, Downcast<Call>(checkpoint_call), adjoint_var, builder_);
+      Tuple args = Downcast<Tuple>(call->args[1]);
+      auto* tuple_sinfo = GetStructInfoAs<TupleStructInfoNode>(partials);
+      if (!tuple_sinfo) {
+        // result_var is a tensor
+        ICHECK(args->fields.size() == 1);
+        UpdateAdjoint(args->fields[0], partials);
       } else {
-        LOG(FATAL) << "Differentiation of call_tir op without te_grad_name is not supported yet.";
+        ICHECK(args->fields.size() == tuple_sinfo->fields.size());
+        for (int i = 0; i < static_cast<int>(args->fields.size()); ++i) {
+          UpdateAdjoint(args->fields[i], TupleGetItem(partials, i));
+        }
       }
     } else {
       const Array<Expr>& partials = gradient_op_map[call_op](
@@ -453,53 +586,67 @@ class GradientMutator : private ExprMutator {
  public:
   static IRModule Transform(IRModule mod, String func_name, Optional<Array<Var>> require_grads,
                             int target_index) {
-    // 1. Copy function
+    // Step 1. Copy function
     auto* old_func = mod->Lookup(func_name).as<FunctionNode>();
     CHECK(old_func) << func_name << "is not a Relax Function";
-    FunctionCopier copier;
-    Function new_func = copier.Copy(GetRef<Function>(old_func));
+    auto new_func = CopyWithNewVars(GetRef<Function>(old_func));
 
-    // 2. Handle require_grads
+    // Step 2. Handle the checkpoints and eliminate start_checkpoint and end_checkpoint ops
+    auto checkpoint_collected = CheckpointCollector::Collect(new_func);
+    new_func = checkpoint_collected.first;
+    auto checkpoints = checkpoint_collected.second;
+
+    // Step 3. Collect call_tir_with_grad information
+    auto tir_grad_collected = CallTIRWithGradEliminator::Transform(new_func);
+
+    // Step 4. Handle require_grads
     // When require_grads is not specified, it would be set to all params of the function
     if (require_grads) {
       CheckRequireGrads(require_grads.value(), old_func->params, func_name);
     }
     // then map the parameter list into new params
-    auto require_grads_value = require_grads.value_or(old_func->params).Map([&copier](Var v) {
-      return copier.var_map[v];
+    auto require_grads_value = require_grads.value_or(old_func->params).Map([&](const Var& v) {
+      return new_func->params[std::find(old_func->params.begin(), old_func->params.end(), v) -
+                              old_func->params.begin()];
     });
 
-    // 3. Handle the checkpoint attribute
-    static constexpr const char* CHECKPOINT_ATTR_KEY = "checkpoint";
-    auto checkpoint = CheckAndUpdateCheckpoint(
-        new_func->attrs.GetAttr<Array<ObjectRef>>(CHECKPOINT_ATTR_KEY), copier.var_map);
-
-    // 4. Generate the adjoint function, use RemoveAllUnused to simplify it, and then return the
-    // IRModule with the adjoint function
-    return GradientMutator(mod, require_grads_value, target_index, checkpoint)
+    // Step 5. Generate the adjoint function, use RemoveAllUnused to simplify it, and then return
+    // the IRModule with the adjoint function
+    return GradientMutator(mod, require_grads_value, target_index, checkpoints)
         .AddAdjointFunction(new_func, func_name, true);
   }
 
  private:
   GradientMutator(const IRModule& module, const Array<Var>& require_grads, int target_index,
-                  Optional<Array<Var>> checkpoint)
+                  const VarIdSet& checkpoints)
       : ExprMutator(module),
         require_grads_(require_grads),
-        checkpoint_(checkpoint),
+        checkpoints_(checkpoints),
         target_index_(target_index) {}
 
   // Add the adjoint function of func to the IRModule using BlockBuilder
   IRModule AddAdjointFunction(const Function& func, const String& func_name,
                               bool remove_all_unused = true) {
-    Function transformed_func = Downcast<Function>(VisitExpr(func));
+    // Step 5.1 forward -> forward + backward
+    auto new_func = Downcast<Function>(VisitExpr(func));
+
+    // Step 5.2 Convert call_tir_with_grad nodes into call_tir nodes
+    // because call_tir_with_grad nodes is not actually implemented
+    new_func = CallTIRWithGradEliminator::Transform(new_func);
+
     if (remove_all_unused) {
-      transformed_func = RemoveAllUnused(transformed_func);
+      new_func = RemoveAllUnused(new_func);
     }
-    builder_->AddFunction(transformed_func, func_name + "_adjoint");
+
+    // Step 5.3 mark the transformed function as public
+    // because the original function may be public, and have gsymbol attribute as func_name
+    auto new_func_name = func_name + "_adjoint";
+    auto new_func_with_gsymbol = WithAttr(new_func, tvm::attr::kGlobalSymbol, new_func_name);
+
+    // Step 5.4 Add the transformed function to IRModule
+    builder_->AddFunction(new_func_with_gsymbol, new_func_name);
     return builder_->GetContextIRModule();
   }
-
-  IRModule GetContextIRModule() const { return builder_->GetContextIRModule(); }
 
   Expr VisitExpr_(const FunctionNode* func) final {
     CHECK(func->body->IsInstance<SeqExprNode>()) << "The body of the function must be SeqExpr.";
@@ -535,7 +682,7 @@ class GradientMutator : private ExprMutator {
     // generate backward bindings and the return value
     return_expr_ = BackwardBindingGenerator::Generate(builder_, GetRef<DataflowBlock>(block),
                                                       require_grads_, target_var_, orig_params_,
-                                                      orig_return_expr_, checkpoint_);
+                                                      orig_return_expr_, checkpoints_);
 
     return builder_->EndBlock();
   }
@@ -581,13 +728,14 @@ class GradientMutator : private ExprMutator {
   // 3. the type of the input var should be Tensor of floating point dtype, or Tuple of that
   static void CheckRequireGrads(const Array<Var>& require_grads, const Array<Var>& func_params,
                                 const String& func_name) {
-    std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual> var_set;
+    VarIdSet var_set;
     for (const auto& var : require_grads) {
       CHECK(std::find(func_params.begin(), func_params.end(), var) != func_params.end())
           << "There is no Var named " << var->name_hint() << " in the parameters of the function "
           << func_name;
-      CHECK_EQ(var_set.count(var), 0) << "Var " << var->name_hint() << " appears more than once";
-      var_set.emplace(var);
+      CHECK_EQ(var_set.count(var->vid), 0)
+          << "Var " << var->name_hint() << " appears more than once";
+      var_set.emplace(var->vid);
 
       CHECK(IsNestedTensorConditioned(GetStructInfo(var), IsFloatTensorSInfo))
           << "Only Tensors of floating point dtype or Tuples of float "
@@ -631,7 +779,7 @@ class GradientMutator : private ExprMutator {
   // differentiation sources
   Array<Var> require_grads_;
   // checkpoint
-  Optional<Array<Var>> checkpoint_;
+  VarIdSet checkpoints_;
   // the differentiation target
   int target_index_;
   Var target_var_;

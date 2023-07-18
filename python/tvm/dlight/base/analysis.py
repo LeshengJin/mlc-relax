@@ -15,11 +15,11 @@
 # specific language governing permissions and limitations
 # under the License.
 """Analysis on TIR blocks, loops and functions."""
-from typing import List, Optional, Union
+from typing import List, Optional, Union, Set
 
 from typing_extensions import Literal
 
-from tvm import tir
+from tvm import ir, tir
 from tvm._ffi import get_global_func
 from tvm.target.target import Target
 from tvm.tir import Schedule
@@ -91,6 +91,26 @@ class BlockInfo:
     def is_injective(self) -> bool:
         """Whether the block is injective, i.e. all its iteration domains are injective."""
         return all(k == "S" for k in self.dom_kind())
+
+    def is_elementwise(self, sch: tir.Schedule) -> bool:
+        """Whether the block is elementwise, i.e. trivial mapping between read/write region"""
+
+        def _check_unit_var_range(dom: ir.Range, var: tir.Var) -> bool:
+            return dom.min.same_as(var) and dom.extent == 1
+
+        if not self.is_injective():
+            return False
+        block = sch.get(self.block_rv)
+        if len(block.reads) != 1 or len(block.writes) != 1:
+            return False
+        r_region = block.reads[0].region
+        w_region = block.writes[0].region
+        if len(r_region) != len(w_region):
+            return False
+        for var, r_dom, w_dom in zip(block.iter_vars, r_region, w_region):
+            if not _check_unit_var_range(var, r_dom) or not _check_unit_var_range(var, w_dom):
+                return False
+        return True
 
     def is_reduction(self) -> bool:
         """Whether the block is a reduction workload."""
@@ -186,3 +206,47 @@ def get_root_block(sch: Schedule, func_name: str = "main") -> BlockRV:
             f"{sch.mod[func_name].body}"
         )
     return sch.get_block(block.name_hint)
+
+
+def _collect_vars_used_in_access_region(region: List[ir.Range]) -> Set[tir.Var]:
+    tir_vars: Set[tir.Var] = set()
+
+    def _collect_tir_var(expr):
+        if isinstance(expr, tir.Var):
+            tir_vars.add(expr)
+
+    for expr in region:
+        assert expr.extent == 1
+        tir.stmt_functor.post_order_visit(expr.min, _collect_tir_var)
+    return tir_vars
+
+
+def detect_dominant_read(block: tir.Block) -> tir.PrimExpr:
+    """Detect the dominant read indices in the block."""
+    dominant_read = None
+    num_read_iters = -1
+    for buffer_region in block.reads:
+        tir_vars = _collect_vars_used_in_access_region(buffer_region.region)
+        if num_read_iters < len(tir_vars):
+            num_read_iters = len(tir_vars)
+            dominant_read = buffer_region
+    assert dominant_read is not None
+    (result,) = dominant_read.buffer.offset_of([e.min for e in dominant_read.region])
+    return result
+
+
+def is_broadcast_epilogue(
+    sch: tir.Schedule,
+    block: tir.schedule.BlockRV,
+    epilogue: tir.schedule.BlockRV,
+) -> bool:
+    """Check if the epilogue block is a broadcast pattern"""
+    write_buffers = {r.buffer for r in sch.get(block).writes}
+    epilogue_iters = {i.var: i for i in sch.get(epilogue).iter_vars if i.dom != 1}
+    for buffer_region in sch.get(epilogue).reads:
+        if buffer_region.buffer not in write_buffers:
+            continue
+        tir_vars = _collect_vars_used_in_access_region(buffer_region.region)
+        if len(tir_vars) < len(epilogue_iters):
+            return True
+    return False

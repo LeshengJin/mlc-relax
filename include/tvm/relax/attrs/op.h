@@ -29,14 +29,15 @@
 namespace tvm {
 namespace relax {
 
-/*! \brief Attributes used in call_tir */
-struct CallTIRAttrs : public tvm::AttrsNode<CallTIRAttrs> {
-  Optional<String> te_grad_name;
+/*! \brief Attributes used in call_tir_with_grad */
+struct CallTIRWithGradAttrs : public tvm::AttrsNode<CallTIRWithGradAttrs> {
+  String te_grad_name;
   Map<String, ObjectRef> te_grad_kwargs;
 
-  TVM_DECLARE_ATTRS(CallTIRAttrs, "relax.attrs.CallTIRAttrs") {
+  TVM_DECLARE_ATTRS(CallTIRWithGradAttrs, "relax.attrs.CallTIRWithGradAttrs") {
     TVM_ATTR_FIELD(te_grad_name)
-        .describe("The name of the te gradient function associated with this call_tir node.");
+        .describe(
+            "The name of the te gradient function associated with this call_tir_with_grad node.");
     TVM_ATTR_FIELD(te_grad_kwargs)
         .describe("The keyword arguments passed to the te gradient function.");
   }

@@ -105,6 +105,12 @@ class CUDADeviceAPI final : public DeviceAPI {
       }
       case kDriverVersion:
         return;
+      case kL2CacheSizeBytes:
+        // Get size of device l2 cache size in bytes.
+        int l2_size = 0;
+        CUDA_CALL(cudaDeviceGetAttribute(&l2_size, cudaDevAttrL2CacheSize, dev.device_id));
+        *rv = l2_size;
+        return;
     }
     *rv = value;
   }
@@ -299,6 +305,10 @@ TVM_DLL String GetCudaFreeMemory() {
 }
 
 TVM_REGISTER_GLOBAL("runtime.GetCudaFreeMemory").set_body_typed(GetCudaFreeMemory);
+
+TVM_REGISTER_GLOBAL("runtime.get_cuda_stream").set_body_typed([]() {
+  return static_cast<void*>(CUDAThreadEntry::ThreadLocal()->stream);
+});
 
 }  // namespace runtime
 }  // namespace tvm

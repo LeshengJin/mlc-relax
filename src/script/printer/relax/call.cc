@@ -98,7 +98,9 @@ Optional<ExprDoc> PrintCallTIRDPSPacked(const relax::Call& n, const ObjectPath& 
                                         const IRDocsifier& d) {
   static const Op& call_tir_op = Op::Get("relax.call_tir");
   static const Op& call_dps_packed_op = Op::Get("relax.call_dps_packed");
-  if (!n->op.same_as(call_tir_op) && !n->op.same_as(call_dps_packed_op)) {
+  static const Op& call_tir_with_grad_op = Op::Get("relax.call_tir_with_grad");
+  if (!n->op.same_as(call_tir_op) && !n->op.same_as(call_dps_packed_op) &&
+      !n->op.same_as(call_tir_with_grad_op)) {
     return NullOpt;
   }
   ICHECK(n->args.size() == 2 || n->args.size() == 3);
@@ -131,17 +133,23 @@ Optional<ExprDoc> PrintCallTIRDPSPacked(const relax::Call& n, const ObjectPath& 
     }
     kwargs_values.push_back(d->AsDoc<ExprDoc>(o_sinfo, o_sinfo_p));
   }
-  auto call_tir_attrs = n->attrs.as<relax::CallTIRAttrs>();
-  if (call_tir_attrs && call_tir_attrs->te_grad_name) {
+
+  // start of specially handling call_tir_with_grad
+  if (const auto* call_tir_with_grad_attrs = n->attrs.as<relax::CallTIRWithGradAttrs>()) {
     kwargs_keys.push_back("te_grad_name");
-    kwargs_values.push_back(LiteralDoc::Str(call_tir_attrs->te_grad_name.value(),
+    kwargs_values.push_back(LiteralDoc::Str(call_tir_with_grad_attrs->te_grad_name,
                                             n_p->Attr("attrs")->Attr("te_grad_name")));
-    if (!call_tir_attrs->te_grad_kwargs.empty()) {
+    if (!call_tir_with_grad_attrs->te_grad_kwargs.empty()) {
       kwargs_keys.push_back("te_grad_kwargs");
-      kwargs_values.push_back(d->AsDoc<ExprDoc>(call_tir_attrs->te_grad_kwargs,
+      kwargs_values.push_back(d->AsDoc<ExprDoc>(call_tir_with_grad_attrs->te_grad_kwargs,
                                                 n_p->Attr("attrs")->Attr("te_grad_kwargs")));
     }
   }
+  if (n->op.same_as(call_tir_with_grad_op)) {
+    return Relax(d, "call_tir_with_grad")->Call(args, kwargs_keys, kwargs_values);
+  }
+  // end of specially handling call_tir_with_grad
+
   if (n->op.same_as(call_dps_packed_op)) {
     return Relax(d, "call_dps_packed")->Call(args, kwargs_keys, kwargs_values);
   }
@@ -198,7 +206,7 @@ Optional<ExprDoc> PrintRelaxPrint(const relax::Call& n, const ObjectPath& n_p,
 TVM_STATIC_IR_FUNCTOR(IRDocsifier, vtable)
     .set_dispatch<relax::Call>(  //
         "", [](relax::Call n, ObjectPath n_p, IRDocsifier d) -> Doc {
-          // Special case: call_tir, call_dps_packed
+          // Special case: call_tir, call_dps_packed, call_tir_with_grad
           if (Optional<ExprDoc> doc = PrintCallTIRDPSPacked(n, n_p, d)) {
             return doc.value();
           }

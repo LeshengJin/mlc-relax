@@ -19,9 +19,9 @@ from tvm.ir import Attrs
 import tvm._ffi
 
 
-@tvm._ffi.register_object("relax.attrs.CallTIRAttrs")
-class CallTIRAttrs(Attrs):
-    """Attributes used in call_tir operator"""
+@tvm._ffi.register_object("relax.attrs.CallTIRWithGradAttrs")
+class CallTIRWithGradAttrs(Attrs):
+    """Attributes used in call_tir_with_grad operator"""
 
 
 @tvm._ffi.register_object("relax.attrs.InitAttrs")

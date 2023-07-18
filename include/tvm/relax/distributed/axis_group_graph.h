@@ -37,16 +37,20 @@ namespace distributed {
 
 /*! \brief tensor axis*/
 struct Axis {
-  const VarNode* var = nullptr;
+  const ExprNode* tensor;
   int dim = 0;
 
-  bool operator==(const Axis& other) const { return var == other.var && dim == other.dim; }
+  Axis(const ExprNode* tensor, int dim) : tensor(tensor), dim(dim) {
+    ICHECK(tensor->IsInstance<ConstantNode>() || tensor->IsInstance<VarNode>());
+  }
+
+  bool operator==(const Axis& other) const { return tensor == other.tensor && dim == other.dim; }
 };
 
 class AxisHash {
  public:
   size_t operator()(const Axis& axis) const {
-    size_t const h1(std::hash<const VarNode*>()(axis.var));
+    size_t const h1(std::hash<const ExprNode*>()(axis.tensor));
     size_t const h2(std::hash<int>()(axis.dim));
     return h1 ^ (h2 << 1);
   }
@@ -96,7 +100,7 @@ class AxisGroupGraph {
   enum class EdgeType { kAscend, kDescend, kSimbling };
 
  private:
-  EdgeType ReverseEdgeType(EdgeType type) {
+  static EdgeType ReverseEdgeType(EdgeType type) {
     switch (type) {
       case EdgeType::kAscend:
         return EdgeType::kDescend;
@@ -109,7 +113,7 @@ class AxisGroupGraph {
     throw;
   }
 
-  int GetEdgePriority(EdgeType type) {
+  static int GetEdgePriority(EdgeType type) {
     switch (type) {
       case EdgeType::kAscend:
         return 0;
@@ -134,6 +138,25 @@ class AxisGroupGraph {
 
     bool operator==(const AxisGraphEdge& other) const {
       return src == other.src && dst == other.dst && type == other.type;
+    }
+  };
+
+  struct Path {
+    int direction = 0;
+
+    Path AddEdge(EdgeType type) { return {direction |= (1 << GetEdgePriority(type))}; }
+
+    int GetPriority() const {
+      switch (direction) {
+        case 1:  // ascend only
+          return 0;
+        case 4:  // descend only
+          return 2;
+        case 0:      // empty path (source node)
+          return 3;  // source node must have max priority
+        default:     // mixed path
+          return 1;
+      }
     }
   };
 
@@ -170,7 +193,7 @@ class AxisGroupGraph {
     axis_sharding_specs_priority_.clear();
     for (const auto& pr : src_axis_sharding_spec_) {
       std::unordered_set<Axis, AxisHash> visited;
-      PropagateShardingSpec(pr.first, pr.second, GetEdgePriority(EdgeType::kDescend), &visited);
+      PropagateShardingSpec(pr.first, pr.second, Path(), &visited);
     }
     ChooseAxisShardingSpec();
   }
@@ -208,7 +231,7 @@ class AxisGroupGraph {
     graph_[src].push_back({src, dst, type});
   }
 
-  void PropagateShardingSpec(Axis axis, AxisShardingSpec spec, int priority,
+  void PropagateShardingSpec(Axis axis, AxisShardingSpec spec, Path path,
                              std::unordered_set<Axis, AxisHash>* visited) {
     if (cutpoint_axis_sharding_spec_.count(axis) ||
         (src_axis_sharding_spec_.count(axis) &&
@@ -220,10 +243,9 @@ class AxisGroupGraph {
     if (!axis_sharding_specs_priority_.count(axis)) {
       axis_sharding_specs_priority_[axis] = {};
     }
-    axis_sharding_specs_priority_[axis][spec] = priority;
+    axis_sharding_specs_priority_[axis][spec] = path.GetPriority();
     for (auto edge : graph_[axis]) {
-      PropagateShardingSpec(edge.dst, spec, std::min(priority, GetEdgePriority(edge.type)),
-                            visited);
+      PropagateShardingSpec(edge.dst, spec, path.AddEdge(edge.type), visited);
     }
   }
 
@@ -231,19 +253,19 @@ class AxisGroupGraph {
     for (auto& pr : axis_sharding_specs_priority_) {
       auto& axis = pr.first;
       auto& specs = pr.second;
-      int min_priority = std::numeric_limits<int>::max();
+      int max_priority = std::numeric_limits<int>::min();
       for (auto& pr2 : specs) {
-        min_priority = std::min(min_priority, pr2.second);
+        max_priority = std::max(max_priority, pr2.second);
       }
       for (auto it = specs.begin(); it != specs.end();) {
-        if (it->second != min_priority) {
+        if (it->second != max_priority) {
           it = specs.erase(it);
         } else {
           it++;
         }
       }
-      ICHECK(specs.size() == 1) << "multiple possible sharding for axis " << axis.var->name_hint()
-                                << " dim " << axis.dim;
+      ICHECK(specs.size() == 1) << "multiple possible sharding for axis: ("
+                                << GetRef<Expr>(axis.tensor) << ", " << axis.dim << ")";
     }
   }
 

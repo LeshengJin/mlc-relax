@@ -131,11 +131,13 @@ def _convert_advanced_activation(inexpr, keras_layer, etab, data_layout, input_s
 
     if act_type == "Softmax":
         axis = keras_layer.axis
-        dims = len(input_shape)
+        dims = len(input_shape) if input_shape else 0
         if isinstance(axis, list):
             raise tvm.error.OpAttributeUnImplemented(f"Softmax with axes {axis} is not supported.")
         if data_layout == "NCHW":
-            if axis == -1:
+            if dims == 0:
+                axis = 0
+            elif axis == -1:
                 axis = 1
             else:
                 axis = axis + 1 if axis < dims - 1 else 1
@@ -1005,6 +1007,8 @@ def _convert_lstm(
     recurrent_weight = etab.new_const(weightList[1].transpose([1, 0]))
     if keras_layer.use_bias:
         in_bias = etab.new_const(weightList[2])
+    if keras_layer.go_backwards:
+        in_data = _op.reverse(in_data, axis=1)
     units = list(weightList[0].shape)[1]
     time_steps = in_shape[1]
     in_data = _op.squeeze(in_data, axis=[0])
@@ -1524,12 +1528,19 @@ def from_keras(model, shape=None, layout="NCHW"):
             raise ValueError("Keras frontend currently supports tensorflow backend only.")
         if keras.backend.image_data_format() != "channels_last":
             raise ValueError("Keras frontend currently supports data_format = channels_last only.")
-        expected_model_class = keras.engine.training.Model
-        if hasattr(keras.engine, "InputLayer"):
-            input_layer_class = keras.engine.InputLayer
+        try:
+            import keras.engine as E
+        except ImportError:
+            try:
+                import keras.src.engine as E
+            except ImportError:
+                raise ImportError("Cannot find Keras's engine")
+        expected_model_class = E.training.Model
+        if hasattr(E, "InputLayer"):
+            input_layer_class = E.InputLayer
         else:
             # TFlite >=2.6
-            input_layer_class = keras.engine.input_layer.InputLayer
+            input_layer_class = E.input_layer.InputLayer
     else:
         # Importing from Tensorflow Keras (tf.keras)
         try:

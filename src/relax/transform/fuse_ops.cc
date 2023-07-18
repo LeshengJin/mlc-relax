@@ -586,9 +586,12 @@ class FunctionCreator : public ExprMutator {
       }
 
       StructInfo param_sinfo = GetStructInfo(expr);
-      Var param(std::move(name), param_sinfo);
-      arguments_.push_back(expr);
-      params_.push_back(param);
+      // Exclude PrimValues from arg/params to make composite functions contain PrimValues.
+      if (!expr->IsInstance<PrimValueNode>()) {
+        Var param(std::move(name), GetStructInfo(expr));
+        arguments_.push_back(expr);
+        params_.push_back(param);
+      }
 
       // Mark the tuple parameter is partially referenced in the beginning.
       // We will remove it from the mapping once we find it is fully referenced.
@@ -1059,6 +1062,18 @@ class PatternBasedPartitioner : ExprVisitor {
       if (check_ != nullptr && !check_(CreatePatternCheckContext(call, matches_opt.value()))) {
         return;
       }
+
+      for (const auto& [pat, match] : matches_opt.value()) {
+        if ((pat->IsInstance<CallPatternNode>() && match != GetRef<Call>(call)) ||
+            pat->IsInstance<TupleGetItemPatternNode>()) {
+          auto g = GetGroup(match);
+          if (g && g->FindRoot()->num_nodes > 1) {
+            // This expression has already been matched to a previous pattern.
+            return;
+          }
+        }
+      }
+
       // If a match is found, put all matching expressions into the same group.
       // OperatorFusor also requires that the bound variable be in the same group as the RHS value.
       // Since is_op(...) based pattern only matches against call nodes on the right hand side,
@@ -1103,6 +1118,13 @@ class PatternBasedPartitioner : ExprVisitor {
   Group* GetGroupForBoundVar(const Var& bound_var) {
     ICHECK(group_map_.count(bound_var.get()));
     return group_map_[bound_var.get()]->FindRoot();
+  }
+
+  Group* GetGroup(const Expr& exp) {
+    if (value_to_bound_var_.count(exp) && group_map_.count(value_to_bound_var_[exp].get())) {
+      return group_map_[value_to_bound_var_[exp].get()];
+    }
+    return nullptr;
   }
 
   PatternCheckContext CreatePatternCheckContext(const CallNode* call,

@@ -700,7 +700,12 @@ class CutlassRelaxFunctionAnnotator(relax.PyExprMutator):
         arg_idx = _extract_arg_idx(op_type, f)
         signature = _extract_relax_function_signature(f)
         lhs_arg = f"arg{arg_idx['lhs']}"
+        rhs_arg = f"arg{arg_idx['w_encoded']}"
         lhs_shape = signature[f"{lhs_arg}_shape"]
+        rhs_shape = signature[f"{rhs_arg}_shape"]
+        ret_shape = signature["ret_shape"]
+        N = ret_shape[-1]
+
         attrs = {
             "op_type": op_type,
             "lhs_arg_idx": arg_idx["lhs"],
@@ -708,7 +713,22 @@ class CutlassRelaxFunctionAnnotator(relax.PyExprMutator):
             "scales_arg_idx": arg_idx["scales"],
             "bias_arg_idx": arg_idx.get("bias"),
             "batch_offset": len(lhs_shape) - 2,
+            "activation": "identity",
         }
+
+        attrs["bias_stride"] = 0
+
+        if "bias" in arg_idx:
+            bias_shape = signature[f"arg{arg_idx['bias']}_shape"]
+            bias_shape_1d = reduce(operator.mul, bias_shape, 1)
+            if bias_shape_1d != bias_shape[-1]:
+                attrs["bias_stride"] = bias_shape[-1]
+
+        if N == rhs_shape[1]:
+            attrs["weight_nbit"] = 8
+        else:
+            assert N == rhs_shape[1] * 2
+            attrs["weight_nbit"] = 4
 
         if "residual" in op_type:
             residual_pos = op_type.find("residual_")
@@ -739,6 +759,11 @@ class CutlassRelaxFunctionAnnotator(relax.PyExprMutator):
                     "residual_arg_idx": arg_idx["residual"],
                 }
             )
+        else:
+            for act in ["relu", "silu", "gelu"]:
+                if act in op_type:
+                    attrs["activation"] = act
+                    break
 
         return f.with_attrs(attrs)
 
@@ -912,10 +937,11 @@ class CutlassRelaxFunctionAnnotator(relax.PyExprMutator):
             }
         )
 
-    def handle_layer_norm(self, f, _):
-        """Annotate a layer norm op."""
+    def handle_norm(self, f, _):
+        """Annotate a layer or rms norm op."""
         signature = _extract_relax_function_signature(f)
         attrs = {}
+        attrs["batch_rank"] = len(signature["arg0_shape"][:-1])
         attrs["M"] = reduce(operator.mul, signature["arg0_shape"][:-1], 1)
         attrs["N"] = signature["arg0_shape"][-1]
         dtype = signature["arg0_dtype"]
@@ -937,8 +963,8 @@ class CutlassRelaxFunctionAnnotator(relax.PyExprMutator):
             return self.handle_matmul(f, op_type)
         elif "attention" in op_type:
             return self.handle_attention(f, op_type)
-        elif "layer_norm" in op_type:
-            return self.handle_layer_norm(f, op_type)
+        elif "layer_norm" in op_type or "rms_norm" in op_type:
+            return self.handle_norm(f, op_type)
 
         raise ValueError("Unsupported composite {}".format(op_type))
 

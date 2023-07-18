@@ -234,8 +234,6 @@ def test_unary(target, dev, unary_op_func, can_be_neg):
     (relax.op.multiply,),
     (relax.op.divide,),
     (relax.op.power,),
-    (relax.op.maximum,),
-    (relax.op.minimum,),
 )
 
 
@@ -244,6 +242,24 @@ def test_binary_arith(target, dev, binary_arith_op_func):
     data1_numpy = np.random.uniform(1, 2, (3, 3)).astype(np.float32)
     data2_numpy = np.random.uniform(1, 2, (3, 3)).astype(np.float32)
     relax_check_gradients(binary_arith_op_func, [data1_numpy, data2_numpy], target, dev)
+
+
+(binary_minmax_op_func,) = tvm.testing.parameters(
+    (relax.op.maximum,),
+    (relax.op.minimum,),
+)
+
+
+@tvm.testing.parametrize_targets("llvm")
+def test_binary_minmax(target, dev, binary_minmax_op_func):
+    # Checking numerical gradient of min and max requires data1_numpy[i] != data2_numpy[i]
+    # for all possible i.
+    # If data1_numpy[i] == data2_numpy[i], the operator is not differentiable w.r.t. place i
+    data1_numpy = np.random.uniform(1, 1.1, (3, 3)).astype(np.float32)
+    delta = np.random.uniform(1, 1.1, (3, 3)).astype(np.float32)
+    sign = np.random.randint(0, 2, (3, 3)).astype(np.float32) * 2 - 1
+    data2_numpy = data1_numpy + delta * sign
+    relax_check_gradients(binary_minmax_op_func, [data1_numpy, data2_numpy], target, dev)
 
 
 (binary_cmp_op_func,) = tvm.testing.parameters(
@@ -731,7 +747,7 @@ def test_nll_loss_no_batch(target, dev, nll_reduction1, nll_weighted1, nll_ignor
     )
 
 
-(c2d_shape1, c2d_shape2, c2d_kwargs,) = tvm.testing.parameters(
+(c2d_shape1, c2d_shape2, c2d_kwargs) = tvm.testing.parameters(
     (
         (3, 2, 10, 10),
         (3, 2, 3, 3),
@@ -781,7 +797,7 @@ def test_conv2d(target, dev, c2d_shape1, c2d_shape2, c2d_kwargs):
     )
 
 
-(pool_size, pool_kwargs,) = tvm.testing.parameters(
+(pool_size, pool_kwargs) = tvm.testing.parameters(
     (
         (3, 3),
         {},
