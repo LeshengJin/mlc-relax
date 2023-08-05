@@ -61,7 +61,9 @@ def conv1d(
     out_dtype : str
         The output data type. If None then output is same type as input.
     """
-    return conv(data, kernel, strides, padding, dilation, groups, data_layout, kernel_layout, out_dtype)
+    return conv(
+        data, kernel, strides, padding, dilation, groups, data_layout, kernel_layout, out_dtype
+    )
 
 
 def conv1d_nwc(data, kernel, strides=1, padding="VALID", dilation=1, out_dtype=None):

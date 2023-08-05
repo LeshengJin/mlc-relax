@@ -20,8 +20,8 @@ from typing import List, Optional, Tuple, Union
 from tvm import DataType
 from tvm.tir import FloatImm
 
-from . import _ffi_api
 from ...expr import Expr
+from . import _ffi_api
 
 
 def conv1d(
@@ -233,6 +233,60 @@ def conv1d_transpose(
     out_layout: Optional[str] = None,
     out_dtype: Optional[Union[str, DataType]] = None,
 ) -> Expr:
+    r"""1D transposed convolution operator.
+
+    This operator can be seen as the gradient operator of conv1d.
+
+    The output shape can be explained in the simple case when `data_layout == "NCW"` and
+    `kernel_layout == "IOW"`. Suppose `data` has shape `(N, in_channel, in_w)`, `weight` has
+    shape `(in_channel, out_channel, weight_w)`, we need to assure that `in_channel % groups == 0`.
+    The shape of the output will be `(N, out_channel * groups, out_w)`, where
+
+    - `out_w = ((in_w - 1) * strides[0] + weight_w - 2 * padding[0] + output_padding[0])`
+
+    Parameters
+    ----------
+    data : relax.Expr
+        The input data to the operator.
+
+    weight : relax.Expr
+        The weight expressions.
+
+    strides : Union[int, Tuple[int]]
+        The strides of convolution. It is required to have length 1.
+
+    padding : Union[int, Tuple[int, ...]]
+        The padding of convolution on both sides of inputs before convolution.
+        It is required to have length either 1 or 2.
+
+    output_padding : Union[int, Tuple[int, ...]], optional
+        Used to disambiguate the output shape.
+
+    dilation : Union[int, Tuple[int]]
+        Specifies the dilation rate to be used for dilated convolution.
+        It is required to have length either 1.
+
+    groups : int
+        Number of groups to split the input into for grouped convolution.
+        The number of input and output channels should be divisible by the number of groups.
+
+    data_layout : str
+        Layout of the input.
+
+    kernel_layout : str
+        Layout of the weight.
+
+    out_layout : Optional[str]
+        Layout of the output. If not specified, it is the same as data_layout
+
+    out_dtype : Optional[Union[str, DataType]]
+        Specifies the output data type for mixed precision conv2d.
+
+    Returns
+    -------
+    result : relax.Expr
+        The computed result.
+    """
     if isinstance(strides, int):
         strides = (strides,)
     if isinstance(dilation, int):
@@ -969,6 +1023,49 @@ def group_norm(
     return _ffi_api.group_norm(  # type: ignore
         data, gamma, beta, num_groups, channel_axis, axes, epsilon, center, scale
     )
+
+
+def rms_norm(
+    data: Expr,
+    weight: Expr,
+    axes: Union[int, List[int]] = -1,
+    epsilon: float = 1e-5,
+) -> Expr:
+    r"""
+    Root mean square normalization (Biao Zhang and et al., 2019).
+    Applies root mean square normalization to the n-dimensional input array.
+    This operator takes an n-dimensional input array and normalizes
+    the input using the given axis:
+
+    .. math::
+
+        out = \frac{data}{\sqrt{mean(data, axis)+\epsilon}} * weight + bias
+
+    Parameters
+    ----------
+    data : relax.Expr
+        Input to which rms_norm will be applied.
+
+    weight : relax.Expr
+        The scale factor.
+
+    bias : relax.Expr
+        The offset factor.
+
+    axes : Union[int, List[int]]
+        The axes that along which the normalization is applied.
+
+    epsilon : float
+        Small float added to square mean to avoid dividing by zero.
+
+    Returns
+    -------
+    result : relax.Expr
+        The computed result.
+    """
+    if isinstance(axes, int):
+        axes = [axes]
+    return _ffi_api.rms_norm(data, weight, axes, epsilon)  # type: ignore
 
 
 def dropout(data: Expr, rate: float = 0.5) -> Expr:

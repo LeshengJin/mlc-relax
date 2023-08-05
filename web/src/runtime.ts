@@ -248,17 +248,17 @@ class RuntimeContext implements Disposable {
 
   detachFromCurrentScope<T extends Disposable>(obj: T): T {
     const currScope = this.autoDisposeScope[this.autoDisposeScope.length - 1];
-    let occurance = 0;
+    let occurrence = 0;
     for (let i = 0; i < currScope.length; ++i) {
       if (currScope[i] === obj) {
-        occurance += 1;
+        occurrence += 1;
         currScope[i] = undefined;
       }
     }
-    if (occurance == 0) {
+    if (occurrence === 0) {
       throw Error("Cannot find obj in the current auto conversion pool");
     }
-    if (occurance > 1) {
+    if (occurrence > 1) {
       throw Error("Value attached to scope multiple times");
     }
     return obj;
@@ -302,7 +302,7 @@ class PackedFuncCell implements Disposable {
     }
   }
 
-  getHandle(requireNotNull: boolean = true): Pointer {
+  getHandle(requireNotNull = true): Pointer {
     if (requireNotNull && this.handle == 0) {
       throw Error("PackedFunc has already been disposed");
     }
@@ -374,7 +374,7 @@ export class DLDevice {
 /**
  * The data type code in DLDataType
  */
-export const enum DLDataTypeCode {
+export enum DLDataTypeCode {
   Int = 0,
   UInt = 1,
   Float = 2,
@@ -508,7 +508,7 @@ export class NDArray implements Disposable {
    * @param requireNotNull require handle is not null.
    * @returns The handle.
    */
-  getHandle(requireNotNull: boolean = true): Pointer {
+  getHandle(requireNotNull = true): Pointer {
     if (requireNotNull && this.handle == 0) {
       throw Error("NDArray has already been disposed");
     }
@@ -709,7 +709,7 @@ export class Module implements Disposable {
    * @param requireNotNull require handle is not null.
    * @returns The handle.
    */
-  getHandle(requireNotNull: boolean = true): Pointer {
+  getHandle(requireNotNull = true): Pointer {
     if (requireNotNull && this.handle == 0) {
       throw Error("Module has already been disposed");
     }
@@ -722,7 +722,7 @@ export class Module implements Disposable {
    * @param queryImports Whether to also query imports
    * @returns The result function.
    */
-  getFunction(name: string, queryImports: boolean = true): PackedFunc {
+  getFunction(name: string, queryImports = true): PackedFunc {
     if (this.handle == 0) {
       throw Error("Module has already been disposed");
     }
@@ -896,7 +896,7 @@ export class TVMString extends TVMObject {
   }
 }
 
-export const enum VMAllocatorKind {
+export enum VMAllocatorKind {
   NAIVE_ALLOCATOR = 1,
   POOLED_ALLOCATOR = 2,
 }
@@ -949,7 +949,7 @@ export class VirtualMachine implements Disposable {
 }
 
 /** Code used as the first argument of the async callback. */
-const enum AyncCallbackCode {
+enum AsyncCallbackCode {
   kReturn = 4,
   kException = 5,
 }
@@ -972,6 +972,7 @@ export interface NDArrayShardEntry {
 export interface InitProgressReport {
   progress: number;
   timeElapsed: number;
+  cacheOnly: boolean;
   text: string;
 }
 
@@ -1003,6 +1004,16 @@ export class ArtifactCache {
       throw Error("Cannot fetch " + url);
     }
     return result;
+  }
+
+  async hasAllKeys(keys: string[]) {
+    if (this.cache === undefined) {
+      this.cache = await caches.open(this.scope);
+    }
+    return this.cache.keys()
+      .then(requests => requests.map(request => request.url))
+      .then(cacheKeys => keys.every(key => cacheKeys.indexOf(key) !== -1))
+      .catch(err => false);
   }
 }
 
@@ -1294,7 +1305,7 @@ export class Instance implements Disposable {
     return this.getGlobalFuncInternal(name, true);
   }
 
-  private getGlobalFuncInternal(name: string, autoAttachToScope: boolean = true): PackedFunc {
+  private getGlobalFuncInternal(name: string, autoAttachToScope = true): PackedFunc {
     const stack = this.lib.getOrAllocCallStack();
     const nameOffset = stack.allocRawBytes(name.length + 1);
     stack.storeRawBytes(nameOffset, StringToUint8Array(name));
@@ -1409,7 +1420,7 @@ export class Instance implements Disposable {
    * @param name The name of the array.
    * @param arr The content.
    */
-  ndarrayCacheUpdate(name: string, arr: NDArray, override: boolean = false) {
+  ndarrayCacheUpdate(name: string, arr: NDArray, override = false) {
     this.ctx.arrayCacheUpdate(name, arr, this.scalar(override ? 1 : 0, "int32"));
   }
 
@@ -1433,7 +1444,7 @@ export class Instance implements Disposable {
   async fetchNDArrayCache(
     ndarrayCacheUrl: string,
     device: DLDevice,
-    cacheScope: string = "tvmjs"
+    cacheScope = "tvmjs"
   ): Promise<any> {
     const artifactCache = new ArtifactCache(cacheScope);
     const jsonUrl = new URL("ndarray-cache.json", ndarrayCacheUrl).href;
@@ -1464,14 +1475,16 @@ export class Instance implements Disposable {
     artifactCache: ArtifactCache
   ) {
     const perf = compact.getPerformance();
-    let tstart = perf.now();
+    const tstart = perf.now();
 
     let totalBytes = 0;
     for (let i = 0; i < list.length; ++i) {
       totalBytes += list[i].nbytes;
-    };
+    }
     let fetchedBytes = 0;
     let timeElapsed = 0;
+
+    const cacheOnly = await artifactCache.hasAllKeys(list.map(key => new URL(key.dataPath, ndarrayCacheUrl).href))
 
     const reportCallback = (iter: number) => {
       // report
@@ -1482,9 +1495,16 @@ export class Instance implements Disposable {
         text += timeElapsed + " secs elapsed.";
         text += " It can take a while when we first visit this page to populate the cache."
         text += " Later refreshes will become faster.";
+        if (cacheOnly) {
+          text = "Loading model from cache[" + iter + "/" + list.length + "]: ";
+          text += Math.ceil(fetchedBytes / (1024 * 1024)).toString() + "MB loaded. "
+          text += Math.floor(fetchedBytes * 100 / totalBytes).toString() + "% completed, "
+          text += timeElapsed + " secs elapsed.";
+        }
         this.initProgressCallback[j]({
           progress: fetchedBytes / totalBytes,
           timeElapsed: timeElapsed,
+          cacheOnly: cacheOnly,
           text: text
         });
       }
@@ -1494,6 +1514,7 @@ export class Instance implements Disposable {
       this.initProgressCallback[j]({
         progress: fetchedBytes / totalBytes,
         timeElapsed: 0,
+        cacheOnly: cacheOnly,
         text: "Start to fetch params",
       });
     }
@@ -1866,7 +1887,7 @@ export class Instance implements Disposable {
       const callback = this.detachFromCurrentScope(args[args.length - 1] as PackedFunc);
       const promise: Promise<any> = func(...fargs);
       promise.then((rv: any) => {
-        callback(this.scalar(AyncCallbackCode.kReturn, "int32"), rv);
+        callback(this.scalar(AsyncCallbackCode.kReturn, "int32"), rv);
         callback.dispose();
       });
     };
@@ -1874,10 +1895,10 @@ export class Instance implements Disposable {
   }
 
   /**
-   * Asynchrously load webgpu pipelines when possible.
+   * Asynchronously load webgpu pipelines when possible.
    * @param mod The input module.
    */
-  async asyncLoadWebGPUPiplines(mod: Module): Promise<void> {
+  async asyncLoadWebGPUPipelines(mod: Module): Promise<void> {
     if (this.lib.webGPUContext == undefined) throw Error("WebGPU not initialied");
     const webgpuContext = this.lib.webGPUContext;
 
@@ -1903,7 +1924,7 @@ export class Instance implements Disposable {
     for (const [key, finfo] of fmapEntries) {
       const code = fGetShader(key);
       assert(key == finfo.name);
-      const event = webgpuContext.createShaderAsync(finfo, code).then((func: Function) => {
+      const event = webgpuContext.createShaderAsync(finfo, code).then((func) => {
         this.beginScope();
         fUpdatePrebuild(key, func);
         this.endScope();
@@ -1927,6 +1948,7 @@ export class Instance implements Disposable {
           this.initProgressCallback[j]({
             progress: progress,
             timeElapsed: timeElapsed,
+            cacheOnly: false,
             text: text
           });
         }
@@ -2001,7 +2023,7 @@ export class Instance implements Disposable {
         let absoluteZeroTimes = 0;
         do {
           if (durationMs > 0.0) {
-            let golden_ratio = 1.618;
+            const golden_ratio = 1.618;
             setupNumber = Math.floor(
               Math.max(minRepeatMs / (durationMs / setupNumber) + 1, setupNumber * golden_ratio)
             );
@@ -2349,4 +2371,23 @@ export function instantiate(
       return new Instance(result.module, {}, result.instance, env);
     }
   );
+}
+
+export async function hasNDArrayInCache(
+  ndarrayCacheUrl: string,
+  cacheScope = "tvmjs"
+): Promise<boolean> {
+  const artifactCache = new ArtifactCache(cacheScope);
+  const jsonUrl = new URL("ndarray-cache.json", ndarrayCacheUrl).href;
+  const hasJsonUrlInCache = await artifactCache.hasAllKeys([jsonUrl]);
+  if (!hasJsonUrlInCache) {
+    return false;
+  }
+  const result = await artifactCache.fetchWithCache(jsonUrl);
+  let list;
+  if (result instanceof Response) {
+    list = await result.json();
+  }
+  list = list["records"] as Array<NDArrayShardEntry>;
+  return await artifactCache.hasAllKeys(list.map(key => new URL(key.dataPath, ndarrayCacheUrl).href));
 }

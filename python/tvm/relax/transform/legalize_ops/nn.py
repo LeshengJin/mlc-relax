@@ -20,10 +20,11 @@ import logging
 import math
 from typing import Optional
 
-from tvm import topi, tir, te
+from tvm import te, tir, topi
+
 from ...block_builder import BlockBuilder
 from ...expr import Call, Expr
-from .common import register_legalize, _call_topi_without_attr
+from .common import _call_topi_without_attr, register_legalize
 
 
 @register_legalize("relax.nn.conv1d")
@@ -147,7 +148,7 @@ def _nn_conv1d_transpose(bb: BlockBuilder, call: Call) -> Expr:
         primfunc_name_hint="conv1d_transpose",
     )
 
-    
+
 @register_legalize("relax.nn.conv2d_transpose")
 def _nn_conv2d_transpose(bb: BlockBuilder, call: Call) -> Expr:
     if call.attrs.out_layout != call.attrs.data_layout:
@@ -372,6 +373,17 @@ def _nn_group_norm(bb: BlockBuilder, call: Call) -> Expr:
         call.attrs.channel_axis,
         call.attrs.axes,
         call.attrs.epsilon,
+    )
+
+
+@register_legalize("relax.nn.rms_norm")
+def _nn_rms_norm(bb: BlockBuilder, call: Call) -> Expr:
+    return bb.call_te(
+        topi.nn.rms_norm,
+        call.args[0],
+        call.args[1],
+        axis=call.attrs.axes,
+        epsilon=call.attrs.epsilon,
     )
 
 
